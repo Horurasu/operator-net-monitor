@@ -8,8 +8,10 @@ Funciona en Linux y Windows. Todo se guarda en una base SQLite local."""
 import calendar
 import csv
 import datetime as dt
+import html
 import json
 import os
+import pathlib
 import queue
 import shutil
 import signal
@@ -19,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import webbrowser
 
 try:
     import psutil
@@ -70,6 +73,9 @@ def abrir_db():
     db.executescript("""
         CREATE TABLE IF NOT EXISTS trafico (fecha TEXT, itf TEXT, rx INTEGER, tx INTEGER,
                                             PRIMARY KEY (fecha, itf));
+        CREATE TABLE IF NOT EXISTS trafico_hora (fecha TEXT, hora INTEGER, itf TEXT,
+                                                 rx INTEGER, tx INTEGER,
+                                                 PRIMARY KEY (fecha, hora, itf));
         CREATE TABLE IF NOT EXISTS sitios (id INTEGER PRIMARY KEY, ts REAL, dominio TEXT,
                                            base TEXT, servicio TEXT, via TEXT, ip TEXT);
         CREATE INDEX IF NOT EXISTS sitios_ts ON sitios(ts);
@@ -319,7 +325,7 @@ class Registrador:
         self.db = abrir_db()
         self.cola = queue.Queue()
         self.ultimos = {}           # dominio -> ts (para no repetir el mismo en 3 s)
-        self.pendiente = {}         # (fecha, itf) -> [rx, tx]
+        self.pendiente = {}         # (fecha, hora, itf) -> [rx, tx]
         self.previo = None
 
     def correr(self):
@@ -353,7 +359,8 @@ class Registrador:
             self.cola.put(("estado", "trafico_error", str(e)))
             return
         if self.previo is not None:
-            hoy = dt.date.today().isoformat()
+            ahora = dt.datetime.now()
+            hoy, hora = ahora.date().isoformat(), ahora.hour
             for n, (rx, tx) in actual.items():
                 p = self.previo.get(n)
                 if not p:
@@ -361,16 +368,26 @@ class Registrador:
                 # Si el contador bajó, la interfaz se reinició: lo leído es lo nuevo
                 drx = rx - p[0] if rx >= p[0] else rx
                 dtx = tx - p[1] if tx >= p[1] else tx
-                acc = self.pendiente.setdefault((hoy, n), [0, 0])
+                acc = self.pendiente.setdefault((hoy, hora, n), [0, 0])
                 acc[0] += drx
                 acc[1] += dtx
         self.previo = actual
 
     def guardar(self):
+        # Se guarda por hora (para los reportes) y por día (para la ventana principal)
+        por_dia = {}
+        for (f, _, n), (rx, tx) in self.pendiente.items():
+            acc = por_dia.setdefault((f, n), [0, 0])
+            acc[0] += rx
+            acc[1] += tx
         self.db.executemany(
             "INSERT INTO trafico VALUES (?, ?, ?, ?) ON CONFLICT(fecha, itf) "
             "DO UPDATE SET rx = rx + excluded.rx, tx = tx + excluded.tx",
-            [(f, n, rx, tx) for (f, n), (rx, tx) in self.pendiente.items()])
+            [(f, n, rx, tx) for (f, n), (rx, tx) in por_dia.items()])
+        self.db.executemany(
+            "INSERT INTO trafico_hora VALUES (?, ?, ?, ?, ?) ON CONFLICT(fecha, hora, itf) "
+            "DO UPDATE SET rx = rx + excluded.rx, tx = tx + excluded.tx",
+            [(f, h, n, rx, tx) for (f, h, n), (rx, tx) in self.pendiente.items()])
         self.db.execute("INSERT OR REPLACE INTO estado VALUES ('latido', ?)", (str(time.time()),))
         self.db.commit()
         self.pendiente.clear()
@@ -486,6 +503,418 @@ class Registrador:
         self.db.commit()
 
 
+# ------------------------------------------------------------ reportes ----
+# Colores del reporte impreso (fondo claro): mismos significados que en la app
+COLOR_REP = {"cable": "#00a3b0", "wifi": "#d6336f", "otra": "#6250d6"}
+TINTE_REP = {"cable": "#8fd3d9", "wifi": "#eda3bd", "otra": "#b3aaea"}   # subida en "solo X"
+NOMBRE_TIPO = {"todo": "CABLE + WIFI", "cable": "SOLO CABLE", "wifi": "SOLO WIFI"}
+
+
+def horas_del_rango(h0, h1):
+    """Horas de h0 (incluida) a h1 (excluida). Si h0 >= h1 el turno cruza la medianoche."""
+    return set(range(h0, h1)) if h0 < h1 else set(range(h0, 24)) | set(range(0, h1))
+
+
+def hora_ampm(h, corto=False):
+    """0 -> 12:00 AM, 13 -> 1:00 PM, 24 -> 12:00 AM (medianoche)."""
+    h12 = h % 12 or 12
+    sufijo = "AM" if h % 24 < 12 else "PM"
+    return f"{h12} {sufijo}" if corto else f"{h12}:00 {sufijo}"
+
+
+def fecha_ampm(momento, fmt_fecha="%d/%m"):
+    """Fecha y hora con minutos en formato de 12 horas: 26/10 3:05 PM."""
+    h = momento.hour
+    return f"{momento:{fmt_fecha}} {h % 12 or 12}:{momento:%M} {'AM' if h < 12 else 'PM'}"
+
+
+def texto_dias(dias_sem):
+    if dias_sem == set(range(7)):
+        return "TODOS LOS DÍAS"
+    if dias_sem == set(range(5)):
+        return "LUNES A VIERNES"
+    return ", ".join(DIAS[i] for i in sorted(dias_sem))
+
+
+def calcular_reporte(db, fl):
+    """fl: {desde, hasta (date), h0, h1, dias (weekdays), modo}. Devuelve el consumo del filtro."""
+    horas = horas_del_rango(fl["h0"], fl["h1"])
+    tipos = ["cable", "wifi", "otra"] if fl["modo"] == "todo" else [fl["modo"]]
+    dias = {}
+    por_hora = {h: {"rx": 0, "tx": 0, "cable": 0, "wifi": 0, "otra": 0} for h in horas}
+    for f, h, itf, rx, tx in db.execute(
+            "SELECT fecha, hora, itf, rx, tx FROM trafico_hora WHERE fecha BETWEEN ? AND ?",
+            (fl["desde"].isoformat(), fl["hasta"].isoformat())):
+        d = dt.date.fromisoformat(f)
+        t = tipo_itf(itf)
+        if d.weekday() not in fl["dias"] or t not in tipos:
+            continue
+        x = dias.setdefault(d, {"rx": 0, "tx": 0, "dia_completo": 0,
+                                "cable": 0, "wifi": 0, "otra": 0})
+        x["dia_completo"] += rx + tx
+        if h in horas:
+            x["rx"] += rx
+            x["tx"] += tx
+            x[t] += rx + tx
+            ph = por_hora[h]
+            ph["rx"] += rx
+            ph["tx"] += tx
+            ph[t] += rx + tx
+    # Todos los días del filtro, aunque no tengan registro por hora
+    filas = []
+    d = fl["desde"]
+    while d <= fl["hasta"]:
+        if d.weekday() in fl["dias"]:
+            x = dias.get(d)
+            filas.append({"d": d, "con_horas": x is not None, **(x or {
+                "rx": 0, "tx": 0, "dia_completo": 0, "cable": 0, "wifi": 0, "otra": 0})})
+        d += dt.timedelta(days=1)
+    for x in filas:
+        x["total"] = x["rx"] + x["tx"]
+    return {"dias": filas, "por_hora": por_hora, "tipos": tipos}
+
+
+def sitios_del_filtro(db, fl):
+    """{dominio: [servicio, primera_vez, ultima_vez, conexiones]} dentro del filtro."""
+    horas = horas_del_rango(fl["h0"], fl["h1"])
+    t0 = time.mktime(fl["desde"].timetuple())
+    t1 = time.mktime((fl["hasta"] + dt.timedelta(days=1)).timetuple())
+    res = {}
+    for dom, serv, f, h, ini, fin, n in db.execute(
+            "SELECT dominio, servicio, date(ts, 'unixepoch', 'localtime'), "
+            "CAST(strftime('%H', ts, 'unixepoch', 'localtime') AS INTEGER), MIN(ts), MAX(ts), COUNT(*) "
+            "FROM sitios WHERE ts >= ? AND ts < ? GROUP BY dominio, 3, 4", (t0, t1)):
+        if h not in horas or dt.date.fromisoformat(f).weekday() not in fl["dias"]:
+            continue
+        x = res.setdefault(dom, [serv, ini, fin, 0])
+        x[1] = min(x[1], ini)
+        x[2] = max(x[2], fin)
+        x[3] += n
+    return res
+
+
+AGRUPAR = [("dominio", "CADA DOMINIO"), ("sitio", "POR SITIO"), ("servicio", "POR SERVICIO")]
+MOSTRAR = [(0, "TODOS"), (10, "10 MÁS COMUNES"), (20, "20 MÁS COMUNES"), (50, "50 MÁS COMUNES")]
+
+
+def agrupar_sitios(sitios, agrupar, top=0):
+    """Junta los dominios: uno por fila, por sitio (google.com reúne mail.google.com,
+    www.google.com…) o por servicio (YouTube reúne todos sus dominios). Con top > 0 deja
+    solo los grupos con más conexiones. Devuelve {clave: grupo} en orden alfabético."""
+    grupos = {}
+    for dom, (serv, ini, fin, n) in sitios.items():
+        base = dominio_base(dom)
+        clave = {"dominio": dom, "sitio": base, "servicio": serv or base}[agrupar]
+        g = grupos.setdefault(clave, {"nombre": clave, "servicio": serv, "base": base,
+                                      "doms": set(), "ini": ini, "fin": fin, "veces": 0})
+        g["doms"].add(dom)
+        g["ini"] = min(g["ini"], ini)
+        g["fin"] = max(g["fin"], fin)
+        g["veces"] += n
+        if serv and not g["servicio"]:
+            g["servicio"] = serv
+    if top:
+        claves = sorted(grupos, key=lambda k: grupos[k]["veces"], reverse=True)[:top]
+        grupos = {k: grupos[k] for k in claves}
+    return dict(sorted(grupos.items(), key=lambda kv: kv[0].lower()))
+
+
+def svg_barras(barras, alto=200, etiqueta_cada=1):
+    """Barras apiladas en SVG. barras: [(etiqueta, sub, [(valor, color, nombre)], tooltip)]."""
+    n = max(len(barras), 1)
+    izq, arr, aba = 64, 18, 40
+    paso = max(18, (840 - izq - 8) / n)     # ancho fijo: el texto no crece con pocas barras
+    ancho, alto_graf = izq + paso * n + 8, alto
+    base = arr + alto_graf
+    maximo = max((sum(v for v, _, _ in segs) for _, _, segs, _ in barras), default=0)
+    p = [f'<svg viewBox="0 0 {ancho} {base + aba}" role="img" class="graf">']
+    for k in range(3):
+        yv = base - alto_graf * k / 2
+        p.append(f'<line x1="{izq}" x2="{ancho}" y1="{yv:.1f}" y2="{yv:.1f}" class="rejilla"/>')
+        if maximo:
+            p.append(f'<text x="{izq - 8}" y="{yv + 4:.1f}" class="eje" text-anchor="end">'
+                     f'{tamano(maximo * k / 2)}</text>')
+    grosor = min(paso * 0.62, 40)
+    for i, (etq, sub, segs, tip) in enumerate(barras):
+        cx = izq + i * paso + paso / 2
+        y = base
+        p.append(f'<g><title>{html.escape(tip)}</title>'
+                 f'<rect x="{cx - paso / 2:.1f}" y="{arr}" width="{paso}" height="{alto_graf}" '
+                 f'fill="transparent"/>')
+        for valor, color, _ in segs:
+            h = alto_graf * valor / maximo if maximo else 0
+            if h >= 0.5:
+                # 2 px de separación entre segmentos apilados
+                p.append(f'<rect x="{cx - grosor / 2:.1f}" y="{y - h:.1f}" width="{grosor:.1f}" '
+                         f'height="{max(h - 2, 0.5):.1f}" rx="2" fill="{color}"/>')
+                y -= h
+        p.append('</g>')
+        if i % etiqueta_cada == 0:
+            p.append(f'<text x="{cx:.1f}" y="{base + 16}" class="eje" text-anchor="middle">'
+                     f'{html.escape(etq)}</text>')
+            if sub:
+                p.append(f'<text x="{cx:.1f}" y="{base + 30}" class="eje sub" '
+                         f'text-anchor="middle">{html.escape(sub)}</text>')
+    p.append('</svg>')
+    return "".join(p)
+
+
+def segmentos_rep(x, modo, tipos):
+    if modo == "todo":
+        return [(x[t], COLOR_REP[t], t.upper()) for t in tipos if x[t]]
+    return [(x["rx"], COLOR_REP[modo], "BAJADA"), (x["tx"], TINTE_REP[modo], "SUBIDA")]
+
+
+def leyenda_rep(modo, tipos, hay_otra):
+    if modo == "todo":
+        items = [(COLOR_REP[t], t.capitalize() if t != "wifi" else "WiFi")
+                 for t in tipos if t != "otra" or hay_otra]
+    else:
+        items = [(COLOR_REP[modo], "Bajada ↓"), (TINTE_REP[modo], "Subida ↑")]
+    return '<div class="leyenda">' + "".join(
+        f'<span><i style="background:{c}"></i>{html.escape(t)}</span>' for c, t in items) + '</div>'
+
+
+def generar_html(fl, rep, grupos, agrupar="dominio", top=0):
+    """Reporte ejecutivo autocontenido, listo para imprimir o guardar como PDF."""
+    e = html.escape
+    modo, tipos = fl["modo"], rep["tipos"]
+    dias = rep["dias"]
+    con_datos = [x for x in dias if x["con_horas"]]
+    usados = [x for x in con_datos if x["total"] > 0]
+    trx = sum(x["rx"] for x in dias)
+    ttx = sum(x["tx"] for x in dias)
+    tot = trx + ttx
+    dia_completo = sum(x["dia_completo"] for x in dias)
+    pico = max(usados, key=lambda x: x["total"]) if usados else None
+    horas_ord = [(h + fl["h0"]) % 24 for h in range(24)]
+    horas_ord = [h for h in horas_ord if h in rep["por_hora"]]
+    total_h = {h: rep["por_hora"][h]["rx"] + rep["por_hora"][h]["tx"] for h in horas_ord}
+    hora_pico = max(horas_ord, key=total_h.get, default=None)
+    if hora_pico is not None and not total_h[hora_pico]:
+        hora_pico = None
+    hay_otra = any(x["otra"] for x in dias)
+    horario = f"{hora_ampm(fl['h0'])} a {hora_ampm(fl['h1'])}"
+    periodo = (f"{fl['desde']:%d/%m/%Y} al {fl['hasta']:%d/%m/%Y}" if fl["desde"] != fl["hasta"]
+               else f"{fl['desde']:%d/%m/%Y}")
+    ahora = dt.datetime.now()
+
+    def kpi(titulo, valor, nota=""):
+        return (f'<div class="kpi"><div class="kt">{e(titulo)}</div><div class="kv">{e(valor)}</div>'
+                f'<div class="kn">{e(nota)}</div></div>')
+
+    kpis = [
+        kpi("Consumo total", tamano(tot), f"{NOMBRE_TIPO[modo].lower()} · {horario}"),
+        kpi("Bajada ↓", tamano(trx), f"{trx * 100 / tot:.0f}% del total" if tot else ""),
+        kpi("Subida ↑", tamano(ttx), f"{ttx * 100 / tot:.0f}% del total" if tot else ""),
+        kpi("Promedio por día", tamano(tot / len(usados)) if usados else "0",
+            f"en {len(usados)} días con uso"),
+        kpi("Día pico", f"{DIAS[pico['d'].weekday()].capitalize()} {pico['d']:%d/%m}"
+            if pico else "—",
+            f"{DIAS_LARGO[pico['d'].weekday()].lower()} · {tamano(pico['total'])}" if pico else ""),
+        kpi("Hora pico", hora_ampm(hora_pico) if hora_pico is not None else "—",
+            f"a {hora_ampm(hora_pico + 1)} · {tamano(total_h[hora_pico])}"
+            if hora_pico is not None else ""),
+        kpi("Peso del horario", f"{tot * 100 / dia_completo:.0f}%" if dia_completo else "—",
+            "del consumo de esos días"),
+    ]
+
+    # Gráfica y tabla por día
+    barras = []
+    for x in dias:
+        d = x["d"]
+        tip = (f"{DIAS_LARGO[d.weekday()].capitalize()} {d:%d/%m/%Y}: "
+               + (f"{tamano(x['total'])} (↓ {tamano(x['rx'])} · ↑ {tamano(x['tx'])})"
+                  if x["con_horas"] else "sin registro por hora"))
+        barras.append((DIAS[d.weekday()][:2], str(d.day), segmentos_rep(x, modo, tipos), tip))
+    graf_dias = svg_barras(barras, etiqueta_cada=1 if len(barras) <= 40 else 2)
+    maximo = max((x["total"] for x in dias), default=0)
+    cols_tipo = [t for t in ("cable", "wifi", "otra") if modo == "todo" and (t != "otra" or hay_otra)]
+    filas_dia = []
+    for x in dias:
+        d = x["d"]
+        celdas = [f"{d:%d/%m/%Y}", DIAS_LARGO[d.weekday()].capitalize()]
+        if not x["con_horas"]:
+            filas_dia.append(f'<tr class="sin"><td>{celdas[0]}</td><td>{celdas[1]}</td>'
+                             f'<td colspan="{4 + len(cols_tipo)}">Sin registro por hora</td></tr>')
+            continue
+        tds = "".join(f'<td class="n">{tamano(x[t])}</td>' for t in cols_tipo)
+        ancho = x["total"] * 100 / maximo if maximo else 0
+        clase = ' class="pico"' if pico and d == pico["d"] else ""
+        filas_dia.append(
+            f'<tr{clase}><td>{celdas[0]}</td><td>{celdas[1]}</td>{tds}'
+            f'<td class="n">{tamano(x["rx"])}</td><td class="n">{tamano(x["tx"])}</td>'
+            f'<td class="n b">{tamano(x["total"])}</td>'
+            f'<td class="uso"><span style="width:{ancho:.1f}%"></span></td></tr>')
+    th_tipo = "".join(f'<th class="n">{"WiFi" if t == "wifi" else t.capitalize()}</th>'
+                      for t in cols_tipo)
+
+    # Perfil por hora
+    barras_h = []
+    filas_hora = []
+    for h in horas_ord:
+        x = rep["por_hora"][h]
+        rango_h = f"{hora_ampm(h)} – {hora_ampm(h + 1)}"
+        h12, sufijo = hora_ampm(h, corto=True).split()
+        barras_h.append((h12, sufijo, segmentos_rep(x, modo, tipos),
+                         f"{rango_h}: {tamano(total_h[h])} "
+                         f"(↓ {tamano(x['rx'])} · ↑ {tamano(x['tx'])})"))
+        tds = "".join(f'<td class="n">{tamano(x[t])}</td>' for t in cols_tipo)
+        filas_hora.append(
+            f'<tr><td>{rango_h}</td>{tds}<td class="n">{tamano(x["rx"])}</td>'
+            f'<td class="n">{tamano(x["tx"])}</td><td class="n b">{tamano(total_h[h])}</td></tr>')
+    graf_horas = svg_barras(barras_h, alto=160)
+
+    # Sitios: en orden alfabético (sin ranking), agrupados como se eligió en la ventana
+    def cuando(t):
+        return fecha_ampm(dt.datetime.fromtimestamp(t), "%d/%m/%Y")
+
+    filas_sitios = []
+    for g in grupos.values():
+        doms = sorted(g["doms"])
+        if agrupar == "dominio":
+            segunda = e(g["servicio"] or "—")
+        else:
+            segunda = e(", ".join(doms[:6])) + (f' <span class="mas">y {len(doms) - 6} más</span>'
+                                                if len(doms) > 6 else "")
+        nombre = g["servicio"] if agrupar == "servicio" and g["servicio"] else g["nombre"]
+        filas_sitios.append(f'<tr><td>{e(nombre)}</td><td class="doms">{segunda}</td>'
+                            f'<td>{cuando(g["ini"])}</td><td>{cuando(g["fin"])}</td></tr>')
+    filas_sitios = "".join(filas_sitios)
+    col2 = "Servicio" if agrupar == "dominio" else "Dominios"
+    col1 = {"dominio": "Dominio", "sitio": "Sitio", "servicio": "Servicio / sitio"}[agrupar]
+    nota_sitios = {"dominio": "Cada dominio por separado",
+                   "sitio": "Agrupados por sitio (p. ej. google.com reúne sus subdominios)",
+                   "servicio": "Agrupados por servicio (p. ej. YouTube reúne todos sus dominios)"}[agrupar]
+    nota_sitios += (f"; se muestran los {top} más frecuentes del horario" if top else "") + \
+        ", en orden alfabético."
+
+    sin_horas = len(dias) - len(con_datos)
+    aviso = (f'<p class="aviso">{sin_horas} de {len(dias)} días del periodo no tienen registro por '
+             f'hora (el detalle por hora existe desde que se instaló la función de reportes).</p>'
+             if sin_horas else "")
+
+    return f"""<!doctype html>
+<html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reporte de consumo de red · {e(periodo)}</title>
+<style>
+:root {{ --tinta:#1a1823; --sec:#5a5768; --suave:#8a8796; --linea:#e3e1ea; --fondo:#fcfcfb;
+        --acento:{COLOR_REP['cable']}; }}
+* {{ box-sizing:border-box; }}
+body {{ margin:0; background:var(--fondo); color:var(--tinta);
+       font:14px/1.45 "Segoe UI", "Helvetica Neue", Arial, sans-serif; }}
+main {{ max-width:900px; margin:0 auto; padding:40px 24px 60px; }}
+header {{ border-bottom:3px solid var(--tinta); padding-bottom:16px; margin-bottom:24px; }}
+h1 {{ font-size:26px; margin:0 0 4px; letter-spacing:-.01em; }}
+h2 {{ font-size:17px; margin:34px 0 10px; padding-bottom:6px; border-bottom:1px solid var(--linea); }}
+.meta {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:8px 20px;
+        margin-top:14px; }}
+.meta div span {{ display:block; font-size:11px; text-transform:uppercase; letter-spacing:.06em;
+                 color:var(--suave); }}
+.meta div b {{ font-weight:600; }}
+.kpis {{ display:grid; grid-template-columns:repeat(4,1fr); gap:12px; }}
+@media (max-width:700px) {{ .kpis {{ grid-template-columns:repeat(2,1fr); }} }}
+.kpi {{ border:1px solid var(--linea); border-radius:8px; padding:12px 14px; background:#fff; }}
+.kt {{ font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--sec); }}
+.kv {{ font-size:24px; font-weight:700; margin:2px 0; font-variant-numeric:tabular-nums; }}
+.kn {{ font-size:12px; color:var(--suave); }}
+.graf {{ width:100%; height:auto; display:block; }}
+.graf .rejilla {{ stroke:var(--linea); stroke-dasharray:2 3; }}
+.graf .eje {{ font-size:10px; fill:var(--sec); }}
+.graf .sub {{ fill:var(--suave); }}
+.graf g:hover rect[fill="transparent"] {{ fill:rgba(0,0,0,.04); }}
+.leyenda {{ display:flex; gap:18px; font-size:12px; color:var(--sec); margin:4px 0 6px; }}
+.leyenda i {{ display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:6px;
+             vertical-align:-1px; }}
+table {{ width:100%; border-collapse:collapse; font-size:13px; font-variant-numeric:tabular-nums; }}
+th {{ text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.05em;
+     color:var(--sec); font-weight:600; border-bottom:1px solid var(--tinta); padding:6px 8px; }}
+td {{ padding:5px 8px; border-bottom:1px solid var(--linea); }}
+.n {{ text-align:right; }} .b {{ font-weight:600; }}
+tr.sin td {{ color:var(--suave); font-style:italic; }}
+tr.pico td {{ background:#fff6db; }}
+.uso {{ width:22%; }}
+.uso span {{ display:block; height:8px; border-radius:0 4px 4px 0; background:var(--tinta); opacity:.75; }}
+.aviso {{ background:#f3f1f8; border-left:3px solid var(--suave); padding:8px 12px; color:var(--sec);
+         font-size:13px; }}
+.nota {{ font-size:12px; color:var(--sec); }}
+td.doms {{ font-size:12px; color:var(--sec); word-break:break-word; }}
+.mas {{ color:var(--suave); white-space:nowrap; }}
+.scroll {{ overflow-x:auto; }}
+footer {{ margin-top:40px; font-size:11px; color:var(--suave); border-top:1px solid var(--linea);
+         padding-top:10px; }}
+@media print {{
+  @page {{ size:A4; margin:14mm; }}
+  main {{ padding:0; max-width:none; }}
+  body {{ background:#fff; font-size:12px; }}
+  .kpi {{ break-inside:avoid; }}
+  section {{ break-inside:auto; }}
+  h2 {{ break-after:avoid; }}
+  tr {{ break-inside:avoid; }}
+  .salto {{ break-before:page; }}
+  * {{ -webkit-print-color-adjust:exact; print-color-adjust:exact; }}
+}}
+@media (max-width:600px) {{ main {{ padding:24px 16px 40px; }} .kv {{ font-size:20px; }} }}
+</style></head>
+<body><main>
+<header>
+  <h1>Reporte de consumo de red</h1>
+  <div class="nota">Reporte ejecutivo de datos consumidos en un horario y tipo de conexión específicos</div>
+  <div class="meta">
+    <div><span>Periodo</span><b>{e(periodo)}</b></div>
+    <div><span>Horario</span><b>{e(horario)}</b></div>
+    <div><span>Días</span><b>{e(texto_dias(fl['dias']).capitalize())}</b></div>
+    <div><span>Conexión</span><b>{e(NOMBRE_TIPO[modo].capitalize().replace('wifi', 'WiFi'))}</b></div>
+    <div><span>Equipo</span><b>{e(socket.gethostname())}</b></div>
+    <div><span>Generado</span><b>{ahora:%d/%m/%Y %H:%M}</b></div>
+  </div>
+</header>
+
+<section>
+  <h2>Resumen</h2>
+  <div class="kpis">{''.join(kpis)}</div>
+  {aviso}
+</section>
+
+<section>
+  <h2>Consumo por día ({e(horario)})</h2>
+  {leyenda_rep(modo, tipos, hay_otra)}
+  <div class="scroll">{graf_dias}</div>
+  <table>
+    <thead><tr><th>Fecha</th><th>Día</th>{th_tipo}<th class="n">Bajada ↓</th>
+      <th class="n">Subida ↑</th><th class="n">Total</th><th></th></tr></thead>
+    <tbody>{''.join(filas_dia)}</tbody>
+  </table>
+</section>
+
+<section class="salto">
+  <h2>Consumo por hora (acumulado del periodo)</h2>
+  {leyenda_rep(modo, tipos, hay_otra)}
+  <div class="scroll">{graf_horas}</div>
+  <table>
+    <thead><tr><th>Hora</th>{th_tipo}<th class="n">Bajada ↓</th><th class="n">Subida ↑</th>
+      <th class="n">Total</th></tr></thead>
+    <tbody>{''.join(filas_hora)}</tbody>
+  </table>
+</section>
+
+<section class="salto">
+  <h2>Sitios y DNS registrados en el horario ({len(grupos)})</h2>
+  <p class="nota">Sitios a los que se conectó el equipo en el periodo, días y horario del reporte.
+  {e(nota_sitios)} Los sitios se registran por horario; no se distinguen por cable o WiFi.</p>
+  <table>
+    <thead><tr><th>{col1}</th><th>{col2}</th><th>Primera vez</th><th>Última vez</th></tr></thead>
+    <tbody>{filas_sitios or '<tr class="sin"><td colspan="4">Sin sitios registrados</td></tr>'}</tbody>
+  </table>
+</section>
+
+<footer>Consumo de Red · 1 GB = 10⁹ bytes · El consumo se mide cada 10 s por interfaz de red y se
+agrupa por hora; las horas se asignan al día en que ocurren.</footer>
+</main></body></html>
+"""
+
+
 # ============================================================== ventana ====
 import tkinter as tk                                    # noqa: E402
 from tkinter import ttk, messagebox, filedialog, font   # noqa: E402
@@ -554,6 +983,16 @@ def boton(padre, texto, cmd):
     return b
 
 
+def boton_grande(padre, texto, color, cmd):
+    """Botón de acción principal: más grande y con su color de borde siempre visible."""
+    b = tk.Label(padre, text=texto, bg=BG, fg=color, font=(F["base"][0], 11, "bold"), padx=16,
+                 pady=7, cursor="hand2", highlightthickness=2, highlightbackground=color)
+    b.bind("<Button-1>", lambda e: cmd())
+    b.bind("<Enter>", lambda e: b.configure(bg=color, fg=BG))
+    b.bind("<Leave>", lambda e: b.configure(bg=BG, fg=color))
+    return b
+
+
 class Selector(tk.Frame):
     """Botones de opción pegados: [ TODO ][ CABLE ][ WIFI ]."""
 
@@ -617,6 +1056,8 @@ def estilos(raiz):
                 font=F["mini"], borderwidth=0)
     s.map("Treeview.Heading", background=[("active", BG)], foreground=[("active", CIAN)])
     s.map("Treeview", background=[("selected", LINEA)], foreground=[("selected", CIAN)])
+    s.configure("Rep.Treeview", rowheight=28)
+    s.map("Rep.Treeview", background=[("selected", LINEA)], foreground=[("selected", CIAN)])
     for barra in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
         s.configure(barra, troughcolor=BG, background=LINEA, bordercolor=BG,
                     arrowcolor=SUB, lightcolor=LINEA, darkcolor=LINEA, gripcount=0)
@@ -680,6 +1121,7 @@ class App(tk.Tk):
         tk.Label(top, text="CONSUMO DE RED", bg=BG, fg=TXT, font=F["titulo"]).pack(side="left")
         tk.Label(top, text="▂▃▅▇", bg=BG, fg=ROSA, font=F["base"]).pack(side="left", padx=8)
         boton(top, "SITIOS ▸", self.abrir_sitios).pack(side="right")
+        boton(top, "REPORTE ▸", self.abrir_reporte).pack(side="right", padx=(8, 0))
         boton(top, "? AYUDA", self.ayuda).pack(side="right", padx=8)
         self.rec = tk.Label(top, text="● REGISTRANDO", bg=BG, fg=ROSA, font=F["chico"])
         self.rec.pack(side="right", padx=8)
@@ -791,6 +1233,12 @@ class App(tk.Tk):
             return
         self.ventana_sitios = VentanaSitios(self)
 
+    def abrir_reporte(self):
+        if getattr(self, "ventana_reporte", None) and self.ventana_reporte.winfo_exists():
+            self.ventana_reporte.lift()
+            return
+        self.ventana_reporte = VentanaReporte(self)
+
     def ayuda(self):
         v = tk.Toplevel(self, bg=BG, padx=24, pady=20)
         v.title("Ayuda")
@@ -817,6 +1265,12 @@ class App(tk.Tk):
             ("TABLA", SUB, F["mini"]),
             ("Clic en un encabezado para ordenar; otro clic invierte el orden.", TXT, F["chico"]),
             ("★ PICO = el día que más se consumió en el mes.", TXT, F["chico"]),
+            ("", SUB, F["chico"]),
+            ("REPORTE ▸", SUB, F["mini"]),
+            ("Elige fechas, horario, días de la semana y conexión (cable, WiFi o ambos).", TXT, F["chico"]),
+            ("Agrupa los sitios (dominio, sitio o servicio), muestra todos o los más comunes,", TXT, F["chico"]),
+            ("quita los que no deben salir y pulsa GENERAR REPORTE:", TXT, F["chico"]),
+            ("se abre en el navegador; con Ctrl+P lo guardas como PDF.", TXT, F["chico"]),
             ("", SUB, F["chico"]),
             ("● REGISTRANDO", SUB, F["mini"]),
             ("El consumo y los sitios se guardan solos en segundo plano,", TXT, F["chico"]),
@@ -1376,6 +1830,464 @@ class VentanaSitios(tk.Toplevel):
                 w.writerow([serv, " ".join(sorted(bases)), veces,
                             dt.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M:%S"),
                             " ".join(sorted(doms))])
+
+
+# ------------------------------------------------------ ventana reporte ----
+class Calendario(tk.Toplevel):
+    """Calendario emergente: clic en un día lo escribe en la variable (dd/mm/aaaa) y se cierra."""
+
+    def __init__(self, master, var, cerca):
+        super().__init__(master, bg=BG, padx=12, pady=10, highlightthickness=1,
+                         highlightbackground=CIAN)
+        self.title("Elegir fecha")
+        self.resizable(False, False)
+        self.transient(master)
+        self.var = var
+        try:
+            self.elegido = dt.datetime.strptime(var.get().strip(), "%d/%m/%Y").date()
+        except ValueError:
+            self.elegido = dt.date.today()
+        self.mes = (self.elegido.year, self.elegido.month)
+
+        cab = tk.Frame(self, bg=BG)
+        cab.pack(fill="x")
+        for texto, paso, lado in (("◀", -1, "left"), ("▶", 1, "right")):
+            b = tk.Label(cab, text=texto, bg=BG, fg=CIAN, font=F["base"], cursor="hand2", padx=8)
+            b.pack(side=lado)
+            b.bind("<Button-1>", lambda e, p=paso: self.mover(p))
+        self.lbl = tk.Label(cab, bg=BG, fg=TXT, font=F["base"])
+        self.lbl.pack(side="left", expand=True)
+        self.rejilla = tk.Frame(self, bg=BG, pady=6)
+        self.rejilla.pack()
+        pie = tk.Frame(self, bg=BG)
+        pie.pack(fill="x")
+        boton(pie, "HOY", lambda: self.elegir(dt.date.today())).pack(side="left")
+        boton(pie, "CERRAR", self.destroy).pack(side="right")
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<MouseWheel>", lambda e: self.mover(-1 if e.delta > 0 else 1))
+        self.bind("<Button-4>", lambda e: self.mover(-1))
+        self.bind("<Button-5>", lambda e: self.mover(1))
+        self.pintar()
+        self.geometry(f"+{cerca.winfo_rootx()}+{cerca.winfo_rooty() + cerca.winfo_height() + 4}")
+        self.after(50, self._tomar_foco)
+
+    def _tomar_foco(self):
+        try:
+            self.grab_set()
+            self.focus_force()
+        except tk.TclError:
+            pass
+
+    def mover(self, paso):
+        y, m = self.mes
+        m += paso
+        self.mes = (y + (m - 1) // 12, (m - 1) % 12 + 1)
+        self.pintar()
+
+    def pintar(self):
+        y, m = self.mes
+        self.lbl["text"] = f"{MESES[m]} {y}"
+        for w in self.rejilla.winfo_children():
+            w.destroy()
+        hoy = dt.date.today()
+        for i, nombre in enumerate(DIAS):
+            tk.Label(self.rejilla, text=nombre[:2], bg=BG, fg=SUB, font=F["mini"],
+                     width=4).grid(row=0, column=i)
+        for fila, semana in enumerate(calendar.monthcalendar(y, m), start=1):
+            for col, dia in enumerate(semana):
+                if not dia:
+                    continue
+                d = dt.date(y, m, dia)
+                fondo, color = (FINDE if col >= 5 else BG), (AMAR if d == hoy else TXT)
+                if d == self.elegido:
+                    fondo, color = CIAN, BG
+                b = tk.Label(self.rejilla, text=str(dia), bg=fondo, fg=color, font=F["base"],
+                             width=4, pady=3, cursor="hand2")
+                b.grid(row=fila, column=col, padx=1, pady=1)
+                b.bind("<Button-1>", lambda e, d=d: self.elegir(d))
+
+    def elegir(self, d):
+        self.var.set(f"{d:%d/%m/%Y}")
+        self.destroy()
+
+
+class VentanaReporte(tk.Toplevel):
+    """Arma un reporte ejecutivo (HTML imprimible) de un periodo, horario, días de la semana y
+    tipo de conexión. Deja agrupar los sitios y quitar los que no deben salir en el reporte."""
+
+    HORAS_INI = {hora_ampm(h): h for h in range(24)}
+    HORAS_FIN = {hora_ampm(h): h for h in range(1, 25)}    # 12:00 AM al final = medianoche
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("Reporte por horario")
+        self.geometry("1020x780")
+        self.minsize(900, 620)
+        self.configure(bg=BG)
+        self.db = abrir_db()
+        self.iconos = Iconos()
+        self.fl = None
+        self.sitios = {}
+        self.grupos = {}
+        try:
+            self.excluidos = set(json.loads(leer_estado(self.db, "reporte_excluidos") or "[]"))
+        except ValueError:
+            self.excluidos = set()
+        self.dias_sem = set(range(5))
+        self.pendiente = None
+
+        barra = tk.Frame(self, bg=BG, padx=20, pady=16)
+        barra.pack(fill="x")
+        tk.Label(barra, text="REPORTE POR HORARIO", bg=BG, fg=TXT, font=F["titulo"]).pack(side="left")
+        boton(barra, "GENERAR REPORTE ▸", self.generar).pack(side="right")
+        separador(self)
+
+        filtros = tk.Frame(self, bg=BG, padx=20, pady=10)
+        filtros.pack(fill="x")
+
+        def fila(n, titulo):
+            tk.Label(filtros, text=titulo, bg=BG, fg=SUB, font=F["mini"], width=10,
+                     anchor="w").grid(row=n, column=0, sticky="w", pady=5)
+            f = tk.Frame(filtros, bg=BG)
+            f.grid(row=n, column=1, sticky="w", pady=5)
+            return f
+
+        hoy = dt.date.today()
+        f = fila(0, "FECHAS")
+        self.v_desde = tk.StringVar(value=f"{hoy.replace(day=1):%d/%m/%Y}")
+        self.v_hasta = tk.StringVar(value=f"{hoy:%d/%m/%Y}")
+        for i, var in enumerate((self.v_desde, self.v_hasta)):
+            if i:
+                tk.Label(f, text="AL", bg=BG, fg=SUB, font=F["mini"]).pack(side="left", padx=8)
+            self.entrada(f, var, 11).pack(side="left", ipady=2)
+            cal = boton(f, "▦", lambda: None)
+            cal.configure(font=F["base"], padx=6)
+            cal.bind("<Button-1>", lambda e, v=var, b=cal: Calendario(self, v, b))
+            cal.pack(side="left", padx=(2, 0))
+        for texto, paso in (("ESTE MES", 0), ("MES PASADO", -1)):
+            boton(f, texto, lambda p=paso: self.poner_mes(p)).pack(side="left", padx=(8, 0))
+
+        f = fila(1, "HORARIO")
+        self.v_h0 = tk.StringVar(value=hora_ampm(9))
+        self.v_h1 = tk.StringVar(value=hora_ampm(16))
+        tk.Label(f, text="DE", bg=BG, fg=SUB, font=F["mini"]).pack(side="left", padx=(0, 8))
+        self.giro(f, self.v_h0, list(self.HORAS_INI)).pack(side="left", ipady=2)
+        tk.Label(f, text="A", bg=BG, fg=SUB, font=F["mini"]).pack(side="left", padx=8)
+        self.giro(f, self.v_h1, list(self.HORAS_FIN)).pack(side="left", ipady=2)
+        for texto, h0, h1 in (("LABORAL 9 AM – 4 PM", 9, 16), ("TODO EL DÍA", 0, 24)):
+            boton(f, texto, lambda a=h0, b=h1: self.poner_horas(a, b)).pack(side="left",
+                                                                             padx=(8, 0))
+        self.lbl_turno = tk.Label(f, bg=BG, fg=SUB, font=F["mini"])
+        self.lbl_turno.pack(side="left", padx=12)
+
+        f = fila(2, "DÍAS")
+        marco = tk.Frame(f, bg=LINEA, padx=1, pady=1)
+        marco.pack(side="left")
+        self.btn_dias = []
+        for i, nombre in enumerate(DIAS):
+            b = tk.Label(marco, text=nombre, font=F["chico"], padx=10, pady=3, cursor="hand2")
+            b.grid(row=0, column=i, padx=(0 if i == 0 else 1, 0))
+            b.bind("<Button-1>", lambda e, i=i: self.alternar_dia(i))
+            self.btn_dias.append(b)
+        for texto, dias in (("LUN–VIE", range(5)), ("TODOS", range(7))):
+            boton(f, texto, lambda d=dias: self.poner_dias(d)).pack(side="left", padx=(8, 0))
+
+        f = fila(3, "CONEXIÓN")
+        self.conexion = Selector(f, [("todo", "CABLE + WIFI"), ("cable", "SOLO CABLE"),
+                                     ("wifi", "SOLO WIFI")], self.programar,
+                                 {"todo": TXT, **COLOR_TIPO})
+        self.conexion.pack(side="left")
+
+        self.resumen = tk.Frame(self, bg=BG, padx=20)
+        self.resumen.pack(fill="x", pady=(8, 0))
+        self.resumen2 = tk.Frame(self, bg=BG, padx=20)
+        self.resumen2.pack(fill="x", pady=(2, 8))
+        separador(self)
+
+        # Sitios: cómo agruparlos, cuántos mostrar y cuáles van en el reporte
+        cab = tk.Frame(self, bg=BG, padx=20, pady=10)
+        cab.pack(fill="x")
+        tk.Label(cab, text="SITIOS Y DNS DEL HORARIO", bg=BG, fg=TXT, font=F["chico"]).pack(side="left")
+        self.agrupar = Selector(cab, AGRUPAR, self.cambiar_vista)
+        self.agrupar.pack(side="right")
+        tk.Label(cab, text="AGRUPAR", bg=BG, fg=SUB, font=F["mini"]).pack(side="right", padx=8)
+
+        cab2 = tk.Frame(self, bg=BG, padx=20)
+        cab2.pack(fill="x")
+        tk.Label(cab2, text="BUSCAR", bg=BG, fg=SUB, font=F["mini"]).pack(side="left", padx=(0, 6))
+        self.filtro = tk.StringVar()
+        self.filtro.trace_add("write", lambda *a: self.llenar_sitios())
+        self.entrada(cab2, self.filtro, 18, avisar=False).pack(side="left", ipady=2)
+        self.mostrar = Selector(cab2, MOSTRAR, self.cambiar_vista)
+        self.mostrar.pack(side="right")
+        tk.Label(cab2, text="MOSTRAR", bg=BG, fg=SUB, font=F["mini"]).pack(side="right", padx=8)
+        agrupar = leer_estado(self.db, "reporte_agrupar")
+        top = leer_estado(self.db, "reporte_top")
+        if agrupar in dict(AGRUPAR):
+            self.agrupar.poner(agrupar)
+        if top.isdigit() and int(top) in dict(MOSTRAR):
+            self.mostrar.poner(int(top))
+
+        acciones = tk.Frame(self, bg=BG, padx=20, pady=10)
+        acciones.pack(fill="x")
+        boton_grande(acciones, "✖  QUITAR DEL REPORTE", ROSA,
+                     lambda: self.poner_en_reporte(self.tree.selection(), False)).pack(side="left")
+        boton_grande(acciones, "✔  PONER EN EL REPORTE", CIAN,
+                     lambda: self.poner_en_reporte(self.tree.selection(), True)).pack(
+                         side="left", padx=8)
+        tk.Label(acciones, text="← A LOS SELECCIONADOS", bg=BG, fg=SUB,
+                 font=F["mini"]).pack(side="left")
+        boton(acciones, "QUITAR TODOS", lambda: self.poner_en_reporte(
+            self.tree.get_children(), False)).pack(side="right")
+        boton(acciones, "PONER TODOS", lambda: self.poner_en_reporte(
+            self.tree.get_children(), True)).pack(side="right", padx=8)
+
+        cuerpo = tk.Frame(self, bg=BG)
+        cuerpo.pack(fill="both", expand=True, padx=20)
+        marco, self.tree = tabla(cuerpo, [
+            ("inc", "EN REPORTE", 110, "center"), ("nombre", "DOMINIO", 230, "w"),
+            ("detalle", "SERVICIO", 230, "w"), ("veces", "CONEXIONES", 95, "e"),
+            ("primera", "PRIMERA VEZ", 145, "center"), ("ultima", "ÚLTIMA VEZ", 145, "center")],
+            icono=True)
+        marco.pack(fill="both", expand=True)
+        self.tree.configure(style="Rep.Treeview", selectmode="extended")
+        self.tree.tag_configure("dentro", foreground=TXT)
+        self.tree.tag_configure("parcial", foreground=SUB)
+        self.tree.tag_configure("fuera", foreground=APAGADO)
+        self.tree.bind("<ButtonRelease-1>", self._clic_fila)
+        self.tree.bind("<Double-Button-1>", lambda e: self.alternar(self.tree.selection()))
+        self.tree.bind("<space>", lambda e: self.alternar(self.tree.selection()))
+        self.tree.bind("<Delete>", lambda e: self.poner_en_reporte(self.tree.selection(), False))
+
+        self.pie = tk.Label(self, bg=BG, fg=SUB, font=F["mini"], anchor="w", justify="left",
+                            padx=20, pady=10,
+                            text="CLIC EN «EN REPORTE» (O DOBLE CLIC / ESPACIO) PARA PONER O QUITAR · "
+                                 "CTRL/SHIFT + CLIC PARA ELEGIR VARIOS · LOS QUITADOS SE RECUERDAN\n"
+                                 "◐ PARCIAL = EL GRUPO TIENE DOMINIOS DENTRO Y FUERA · "
+                                 "EL DETALLE POR HORA SE REGISTRA DESDE QUE SE INSTALÓ ESTA FUNCIÓN")
+        self.pie.pack(fill="x", side="bottom", before=cuerpo)   # siempre visible
+        self.pintar_dias()
+        self.actualizar()
+
+    # ---- controles ----
+    def entrada(self, padre, var, ancho, avisar=True):
+        if avisar:
+            var.trace_add("write", lambda *a: self.programar())
+        return tk.Entry(padre, textvariable=var, width=ancho, bg=BG, fg=TXT, insertbackground=CIAN,
+                        relief="flat", highlightthickness=1, highlightbackground=LINEA,
+                        highlightcolor=CIAN, font=F["base"])
+
+    def giro(self, padre, var, valores):
+        var.trace_add("write", lambda *x: self.programar())
+        actual = var.get()
+        g = tk.Spinbox(padre, textvariable=var, values=valores, width=9, wrap=True,
+                       state="readonly", bg=BG, readonlybackground=BG, fg=TXT, buttonbackground=BG,
+                       relief="flat", highlightthickness=1, highlightbackground=LINEA,
+                       highlightcolor=CIAN, font=F["base"], justify="center")
+        var.set(actual)     # el Spinbox se pone en el primer valor al crearse
+        g.bind("<MouseWheel>", lambda e: g.invoke("buttonup" if e.delta > 0 else "buttondown"))
+        g.bind("<Button-4>", lambda e: g.invoke("buttonup"))
+        g.bind("<Button-5>", lambda e: g.invoke("buttondown"))
+        return g
+
+    def poner_mes(self, paso):
+        hoy = dt.date.today()
+        ini = hoy.replace(day=1)
+        if paso:
+            fin = ini - dt.timedelta(days=1)
+            ini = fin.replace(day=1)
+        else:
+            fin = hoy
+        self.v_desde.set(f"{ini:%d/%m/%Y}")
+        self.v_hasta.set(f"{fin:%d/%m/%Y}")
+
+    def poner_horas(self, h0, h1):
+        self.v_h0.set(hora_ampm(h0))
+        self.v_h1.set(hora_ampm(h1))
+
+    def alternar_dia(self, i):
+        self.dias_sem ^= {i}
+        self.pintar_dias()
+        self.programar()
+
+    def poner_dias(self, dias):
+        self.dias_sem = set(dias)
+        self.pintar_dias()
+        self.programar()
+
+    def pintar_dias(self):
+        for i, b in enumerate(self.btn_dias):
+            b.configure(bg=CIAN if i in self.dias_sem else BG, fg=BG if i in self.dias_sem else SUB)
+
+    def programar(self):
+        """Espera a que se termine de escribir antes de recalcular."""
+        if self.pendiente:
+            self.after_cancel(self.pendiente)
+        self.pendiente = self.after(400, self.actualizar)
+
+    def leer_filtros(self):
+        try:
+            desde = dt.datetime.strptime(self.v_desde.get().strip(), "%d/%m/%Y").date()
+            hasta = dt.datetime.strptime(self.v_hasta.get().strip(), "%d/%m/%Y").date()
+        except ValueError:
+            return None, "FECHA NO VÁLIDA · USA dd/mm/aaaa O EL BOTÓN ▦"
+        if desde > hasta:
+            return None, "LA FECHA INICIAL ES DESPUÉS DE LA FINAL"
+        h0 = self.HORAS_INI.get(self.v_h0.get())
+        h1 = self.HORAS_FIN.get(self.v_h1.get())
+        if h0 is None or h1 is None:
+            return None, "HORA NO VÁLIDA"
+        if not self.dias_sem:
+            return None, "ELIGE AL MENOS UN DÍA DE LA SEMANA"
+        return {"desde": desde, "hasta": hasta, "h0": h0, "h1": h1, "dias": set(self.dias_sem),
+                "modo": self.conexion.valor}, ""
+
+    # ---- datos ----
+    def actualizar(self):
+        self.pendiente = None
+        fl, error = self.leer_filtros()
+        if not fl:
+            self.fl = None
+            texto_rico(self.resumen, [("⚠ " + error, ROSA)])
+            texto_rico(self.resumen2, [])
+            return
+        self.fl = fl
+        self.lbl_turno["text"] = ("TURNO NOCTURNO (CRUZA LA MEDIANOCHE)"
+                                  if fl["h0"] > fl["h1"] else "")
+        self.rep = calcular_reporte(self.db, fl)
+        self.sitios = sitios_del_filtro(self.db, fl)
+        self.cambiar_vista()
+
+    def cambiar_vista(self):
+        self.db.executemany("INSERT OR REPLACE INTO estado VALUES (?, ?)",
+                            [("reporte_agrupar", self.agrupar.valor),
+                             ("reporte_top", str(self.mostrar.valor))])
+        self.db.commit()
+        agrupar = self.agrupar.valor
+        self.grupos = agrupar_sitios(self.sitios, agrupar, self.mostrar.valor)
+        self.tree.heading("nombre", text={"dominio": "DOMINIO", "sitio": "SITIO",
+                                          "servicio": "SERVICIO / SITIO"}[agrupar])
+        self.tree.heading("detalle", text="SERVICIO" if agrupar == "dominio" else "DOMINIOS")
+        if self.fl:
+            self.pintar_resumen()
+        self.llenar_sitios()
+
+    def pintar_resumen(self):
+        fl, rep = self.fl, self.rep
+        rx = sum(x["rx"] for x in rep["dias"])
+        tx = sum(x["tx"] for x in rep["dias"])
+        con = sum(1 for x in rep["dias"] if x["con_horas"])
+        en_reporte = sum(1 for g in self.grupos.values() if g["doms"] - self.excluidos)
+        fuera = len(self.grupos) - en_reporte
+        color = CIAN if fl["modo"] == "todo" else COLOR_TIPO[fl["modo"]]
+        texto_rico(self.resumen, [
+            ("▸ ", color), (f"CONSUMO EN EL FILTRO {tamano(rx + tx)}", TXT),
+            (f"   ↓ {tamano(rx)}   ↑ {tamano(tx)}", SUB)])
+        unidad = {"dominio": "DOMINIOS", "sitio": "SITIOS", "servicio": "GRUPOS"}[self.agrupar.valor]
+        texto_rico(self.resumen2, [
+            (f"  {con} DE {len(rep['dias'])} DÍAS CON REGISTRO POR HORA", SUB),
+            (f"   · {en_reporte} {unidad} EN EL REPORTE", SUB),
+            (f" ({fuera} QUITADO{'S' if fuera > 1 else ''})" if fuera else "", ROSA)], F["mini"])
+
+    def llenar_sitios(self):
+        f = self.filtro.get().strip().lower()
+        self.tree.delete(*self.tree.get_children())
+        for clave, g in self.grupos.items():
+            if f and f not in clave.lower() and f not in g["servicio"].lower() \
+                    and not any(f in d for d in g["doms"]):
+                continue
+            self.tree.insert("", "end", iid=clave, image=self.iconos.de(g["servicio"], g["base"]))
+            self.pintar_fila(clave)
+
+    def pintar_fila(self, clave):
+        g = self.grupos[clave]
+        dentro = len(g["doms"] - self.excluidos)
+        if dentro == len(g["doms"]):
+            estado, tag = "✔ SÍ", "dentro"
+        elif dentro:
+            estado, tag = f"◐ {dentro} DE {len(g['doms'])}", "parcial"
+        else:
+            estado, tag = "✖ NO", "fuera"
+        if self.agrupar.valor == "dominio":
+            nombre, detalle = clave, g["servicio"] or "—"
+        else:
+            doms = sorted(g["doms"])
+            nombre = g["servicio"] if self.agrupar.valor == "servicio" and g["servicio"] else clave
+            detalle = f"{len(doms)} · " + ", ".join(doms[:3]) + (" …" if len(doms) > 3 else "")
+        self.tree.item(clave, tags=(tag,), values=(
+            estado, nombre, detalle, g["veces"],
+            fecha_ampm(dt.datetime.fromtimestamp(g["ini"])),
+            fecha_ampm(dt.datetime.fromtimestamp(g["fin"]))))
+
+    def _clic_fila(self, e):
+        # Solo la columna EN REPORTE alterna con un clic; en las demás el clic selecciona
+        if self.tree.identify_column(e.x) == "#1" and self.tree.identify_region(e.x, e.y) == "cell":
+            fila = self.tree.identify_row(e.y)
+            if fila:
+                self.alternar([fila])
+
+    def alternar(self, claves):
+        for k in claves:
+            doms = self.grupos[k]["doms"]
+            self.marcar(doms, incluir=not (doms - self.excluidos))
+        self.guardar_excluidos(claves)
+
+    def poner_en_reporte(self, claves, incluir):
+        if not claves:
+            messagebox.showinfo("Reporte", "Primero elige uno o varios sitios de la lista "
+                                "(Ctrl o Shift + clic para varios).", parent=self)
+            return
+        for k in claves:
+            self.marcar(self.grupos[k]["doms"], incluir)
+        self.guardar_excluidos(claves)
+
+    def marcar(self, doms, incluir):
+        if incluir:
+            self.excluidos -= doms
+        else:
+            self.excluidos |= doms
+
+    def guardar_excluidos(self, cambiados):
+        """Se recuerdan en la base para el próximo reporte."""
+        self.db.execute("INSERT OR REPLACE INTO estado VALUES ('reporte_excluidos', ?)",
+                        (json.dumps(sorted(self.excluidos)),))
+        self.db.commit()
+        for k in cambiados:
+            self.pintar_fila(k)
+        if self.fl:
+            self.pintar_resumen()
+
+    def grupos_para_reporte(self):
+        """Los grupos visibles en la ventana, solo con sus dominios que van en el reporte."""
+        res = {}
+        for clave, g in self.grupos.items():
+            doms = g["doms"] - self.excluidos
+            if not doms:
+                continue
+            res[clave] = {**g, "doms": doms, "ini": min(self.sitios[d][1] for d in doms),
+                          "fin": max(self.sitios[d][2] for d in doms)}
+        return res
+
+    def generar(self):
+        if not self.fl:
+            messagebox.showwarning("Reporte", "Revisa los filtros antes de generar el reporte.",
+                                   parent=self)
+            return
+        fl = self.fl
+        rep = calcular_reporte(self.db, fl)
+        if not any(x["con_horas"] for x in rep["dias"]):
+            if not messagebox.askyesno("Reporte", "En ese periodo no hay consumo registrado por "
+                                       "hora. ¿Generar el reporte de todas formas?", parent=self):
+                return
+        ruta = filedialog.asksaveasfilename(
+            parent=self, defaultextension=".html", filetypes=[("Página web", "*.html")],
+            initialfile=f"reporte_red_{fl['desde']:%Y-%m-%d}_a_{fl['hasta']:%Y-%m-%d}.html")
+        if not ruta:
+            return
+        with open(ruta, "w", encoding="utf-8") as fh:
+            fh.write(generar_html(fl, rep, self.grupos_para_reporte(), self.agrupar.valor,
+                                  self.mostrar.valor))
+        webbrowser.open(pathlib.Path(ruta).resolve().as_uri())
 
 
 if __name__ == "__main__":

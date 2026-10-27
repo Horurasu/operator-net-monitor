@@ -24,6 +24,13 @@ computadora y no se envían a ningún lado.
   icono gris.
 - **Registro automático**: arranca al iniciar sesión, sin pulsar ningún botón.
 - **Exportar a CSV** el resumen de sitios de cualquier día.
+- **Reporte ejecutivo por horario** (`REPORTE ▸`): eliges fechas (con calendario), horario en
+  formato AM/PM (por ejemplo 9:00 AM a 4:00 PM, o un turno nocturno 10:00 PM a 6:00 AM), días de
+  la semana y conexión (cable, WiFi o ambos). Genera una página lista para imprimir o guardar como
+  PDF (Ctrl+P) con indicadores, consumo por día y por hora, y los sitios/DNS de ese horario.
+  Los sitios se pueden agrupar (cada dominio, por sitio o por servicio), mostrar todos o solo los
+  más comunes, y quitar o poner los que quieras en el reporte; lo que quitas se recuerda para el
+  siguiente. El detalle por hora se registra desde que instalas esta versión.
 - Si tienes **vnstat** (Linux), también muestra el historial de antes de instalar la app.
 
 ## Capturas
